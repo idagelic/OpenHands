@@ -1507,18 +1507,18 @@ urllib3 = ">=1.25.3,<3.0.0"
 
 [[package]]
 name = "daytona-sdk"
-version = "0.9.0"
+version = "0.9.1"
 description = "Python SDK for Daytona"
 optional = false
 python-versions = ">=3.7"
 groups = ["main"]
 files = [
-    {file = "daytona_sdk-0.9.0-py3-none-any.whl", hash = "sha256:9d1fe377b944e7306064a271f7d931bfae5337590b31063e1aac82264fa098f3"},
-    {file = "daytona_sdk-0.9.0.tar.gz", hash = "sha256:a7d1b9f882be1c1a98b0c3a7c50f46c3651bda235c45cb8cad9ddaa6cacbf9a2"},
+    {file = "daytona_sdk-0.9.1-py3-none-any.whl", hash = "sha256:cce6c90cd3d578747b3c388e24c811cb0b21ad125d34b32836c50059a577a12a"},
+    {file = "daytona_sdk-0.9.1.tar.gz", hash = "sha256:1e2f219f55130fc72d2f14a57d008b8d3e236d45294e0ca51e249106be5ca5de"},
 ]
 
 [package.dependencies]
-daytona_api_client = ">=0.12.2,<1.0.0"
+daytona_api_client = ">=0.13.0,<1.0.0"
 environs = ">=9.5.0,<10.0.0"
 marshmallow = ">=3.19.0,<4.0.0"
 pydantic = ">=2.4.2,<3.0.0"
@@ -10585,4 +10585,4 @@ testing = ["coverage[toml]", "zope.event", "zope.testing"]
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.12"
-content-hash = "452edc4e08460e91a299033d0f3d45472ac89d3cee9730694f806d33e3925bf7"
+content-hash = "6684160b46761a2e0cc5d3f1e070e8849bf62f39b7a6167cccc702827b49833e"

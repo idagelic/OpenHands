@@ -20,7 +20,7 @@ from openhands.runtime.utils.command import get_action_execution_server_startup_
 from openhands.utils.tenacity_stop import stop_if_should_exit
 
 WORKSPACE_PREFIX = 'openhands-sandbox-'
-DAYTONA_URL = (
+DAYTONA_API_URL = (
     'https://stage.daytona.work/api'  # TODO: Parametrize and change to production
 )
 
@@ -52,7 +52,7 @@ class DaytonaRuntime(ActionExecutionClient):
 
         daytona_config = DaytonaConfig(
             api_key=config.daytona_api_key.get_secret_value(),
-            server_url=DAYTONA_URL,
+            server_url=DAYTONA_API_URL,
             target='eu',  # TODO: Parametrize
         )
         self.daytona = Daytona(daytona_config)
@@ -130,15 +130,15 @@ class DaytonaRuntime(ActionExecutionClient):
     def _get_action_execution_server_host(self) -> str:
         return self.api_url
 
-    def _set_env_vars_in_workspace(self, exec_session_id: str) -> None:
-        # Quickfix for env vars not being set in the workspace, TODO remove this
-        for key, value in self._get_creation_env_vars().items():
-            self.workspace.process.execute_session_command(
-                exec_session_id,
-                SessionExecuteRequest(
-                    command=f'export {key}="{value}"', var_async=True
-                ),
-            )
+    # def _set_env_vars_in_workspace(self, exec_session_id: str) -> None:
+    #     # Quickfix for env vars not being set in the workspace, TODO remove this
+    #     for key, value in self._get_creation_env_vars().items():
+    #         self.workspace.process.execute_session_command(
+    #             exec_session_id,
+    #             SessionExecuteRequest(
+    #                 command=f'export {key}="{value}"', var_async=True
+    #             ),
+    #         )
 
     def _start_action_execution_server(self) -> None:
         self.workspace.process.exec(
@@ -158,8 +158,6 @@ class DaytonaRuntime(ActionExecutionClient):
             exec_session_id,
             SessionExecuteRequest(command='cd /openhands/code', var_async=True),
         )
-
-        self._set_env_vars_in_workspace(exec_session_id)
 
         exec_command = self.workspace.process.execute_session_command(
             exec_session_id,
