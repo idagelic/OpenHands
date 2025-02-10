@@ -76,6 +76,8 @@ class AppConfig(BaseModel):
     file_uploads_allowed_extensions: list[str] = Field(default_factory=lambda: ['.*'])
     runloop_api_key: SecretStr | None = Field(default=None)
     daytona_api_key: SecretStr | None = Field(default=None)
+    daytona_api_url: str = Field(default='https://daytona.work/api')
+    daytona_target: str = Field(default='us')
     cli_multiline_input: bool = Field(default=False)
 
     defaults_dict: ClassVar[dict] = {}
