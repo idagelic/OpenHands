@@ -1,7 +1,9 @@
+import asyncio
 import json
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional, Set
 
 import tenacity
+from aiohttp import ClientSession, ClientTimeout
 from daytona_sdk import (
     CreateWorkspaceParams,
     Daytona,
@@ -20,6 +22,7 @@ from openhands.runtime.utils.command import get_action_execution_server_startup_
 from openhands.utils.tenacity_stop import stop_if_should_exit
 
 WORKSPACE_PREFIX = 'openhands-sandbox-'
+
 
 class DaytonaRuntime(ActionExecutionClient):
     """The DaytonaRuntime class is an DockerRuntime that utilizes Daytona workspace as a runtime environment."""
@@ -49,7 +52,7 @@ class DaytonaRuntime(ActionExecutionClient):
         daytona_config = DaytonaConfig(
             api_key=config.daytona_api_key.get_secret_value(),
             server_url=config.daytona_api_url,
-            target=config.daytona_target
+            target=config.daytona_target,
         )
         self.daytona = Daytona(daytona_config)
 
@@ -72,6 +75,103 @@ class DaytonaRuntime(ActionExecutionClient):
             attach_to_existing,
             headless_mode,
         )
+        self._closed = False
+        self._port_proxies: Dict[int, str] = {}  # Track active port proxies
+        self._proxy_servers: Dict[int, asyncio.Server] = {}
+        self._proxy_tasks: Set[asyncio.Task] = set()
+        # Add lock for port polling
+        self._port_poll_lock = asyncio.Lock()
+
+    async def _proxy_handler(
+        self,
+        local_reader: asyncio.StreamReader,
+        local_writer: asyncio.StreamWriter,
+        target_url: str,
+    ):
+        """Handle a single proxy connection."""
+        try:
+            # Read the incoming HTTP request
+            request_data = await local_reader.read(8192)
+            if not request_data:
+                return
+
+            # Parse the HTTP request to get the method
+            request_lines = request_data.decode('utf-8', 'ignore').split('\n')
+            if not request_lines:
+                return
+
+            # Get HTTP method from first line (e.g., "GET /path HTTP/1.1")
+            method = request_lines[0].split(' ')[0]
+
+            # Forward the request to the target URL
+            timeout = ClientTimeout(total=30)
+            async with ClientSession(timeout=timeout) as session:
+                async with session.request(
+                    method=method,
+                    url=target_url,
+                    data=request_data,
+                    headers={'Connection': 'close', 'Host': target_url.split('://')[1]},
+                ) as response:
+                    response_data = await response.read()
+                    # Write response status line
+                    status_line = f'HTTP/1.1 {response.status} {response.reason}\r\n'
+                    local_writer.write(status_line.encode())
+                    # Write response headers
+                    for header, value in response.headers.items():
+                        local_writer.write(f'{header}: {value}\r\n'.encode())
+                    local_writer.write(b'\r\n')
+                    # Write response body
+                    local_writer.write(response_data)
+                    await local_writer.drain()
+        except Exception as e:
+            self.log('error', f'Proxy error: {str(e)}')
+        finally:
+            local_writer.close()
+            await local_writer.wait_closed()
+
+    async def _start_proxy(self, remote_port: int, proxy_url: str) -> int:
+        """Start a proxy server for a given port."""
+        # Try to use the same port number as the remote port
+        try:
+
+            async def handle_connection(reader, writer):
+                task = asyncio.create_task(
+                    self._proxy_handler(reader, writer, proxy_url)
+                )
+                self._proxy_tasks.add(task)
+                task.add_done_callback(self._proxy_tasks.discard)
+
+            server = await asyncio.start_server(
+                handle_connection, 'localhost', remote_port
+            )
+            self._proxy_servers[remote_port] = server
+            return remote_port
+        except OSError as e:
+            # Log the specific error details
+            error_code = getattr(e, 'errno', None)
+            error_msg = str(e)
+            if error_code == 98:  # Address already in use
+                self.log(
+                    'warning',
+                    f'Port {remote_port} is already in use on localhost (errno={error_code}): {error_msg}',
+                )
+            elif error_code == 13:  # Permission denied
+                self.log(
+                    'error',
+                    f'Permission denied when trying to bind to port {remote_port} (errno={error_code}): {error_msg}',
+                )
+            else:
+                self.log(
+                    'error',
+                    f'Failed to start proxy on port {remote_port} (errno={error_code}): {error_msg}',
+                )
+            return -1
+
+    async def _stop_proxy(self, port: int):
+        """Stop a proxy server for a given port."""
+        if server := self._proxy_servers.pop(port, None):
+            server.close()
+            await server.wait_closed()
 
     def _get_workspace(self) -> Optional[Workspace]:
         try:
@@ -127,16 +227,17 @@ class DaytonaRuntime(ActionExecutionClient):
         return self.api_url
 
     def _start_action_execution_server(self) -> None:
+        assert self.workspace is not None, 'Workspace is not initialized'
         self.workspace.process.exec(
             f'mkdir -p {self.config.workspace_mount_path_in_sandbox}'
         )
 
-        start_command = get_action_execution_server_startup_command(
+        command_args = get_action_execution_server_startup_command(
             server_port=self._sandbox_port,
             plugins=self.plugins,
             app_config=self.config,
         )
-        start_command: str = ' '.join(start_command)
+        start_command: str = ' '.join(command_args)
 
         exec_session_id = 'action-execution-server'
         self.workspace.process.create_session(exec_session_id)
@@ -160,15 +261,94 @@ class DaytonaRuntime(ActionExecutionClient):
     def _wait_until_alive(self):
         super().check_if_alive()
 
+    async def _get_active_ports(self) -> Set[int]:
+        """Get currently active ports in the workspace."""
+        async with self._port_poll_lock:
+            assert self.workspace is not None, 'Workspace is not initialized'
+            # Using netstat to check for listening TCP ports
+            output = self.workspace.process.execute_session_command(
+                'port-poller-session',
+                SessionExecuteRequest(
+                    command="netstat -tln | grep ':[0-9].*LISTEN' | awk '{print $4}' | sed 's/.*://'",
+                    var_async=False,
+                ),
+            )
+
+            ports = set()
+            # Assuming the output is in the result directly
+            for line in output.output.splitlines():
+                try:
+                    port = int(line.strip())
+                    # Between 3000 and 10000 and not the sandbox or vscode port
+                    if 3000 <= port <= 10000 and port not in [
+                        self._sandbox_port,
+                        self._vscode_port,
+                    ]:  # Filter ports in our range of interest
+                        ports.add(port)
+                except ValueError:
+                    continue
+            return ports
+
+    def _create_proxy_url(self, port: int) -> str:
+        """Create a proxy URL for the given port."""
+        return self._construct_api_url(port)
+
+    async def _monitor_ports(self):
+        """Continuously monitor ports in the workspace and create proxies for new ports."""
+        previous_ports: set[int] = set()
+        self.log('info', 'Starting port monitoring...')
+
+        while not self._closed:
+            try:
+                current_ports = await self._get_active_ports()
+
+                # Check for newly opened ports
+                new_ports = current_ports - previous_ports
+                for port in new_ports:
+                    proxy_url = self._create_proxy_url(port)
+                    local_port = await self._start_proxy(port, proxy_url)
+                    if (
+                        local_port != -1
+                    ):  # Only add proxy if port was successfully bound
+                        self._port_proxies[port] = f'http://localhost:{local_port}'
+                        self.log(
+                            'info',
+                            f'Opening proxy {port} -> localhost:{local_port} -> {proxy_url}',
+                        )
+
+                # Check for closed ports
+                closed_ports = previous_ports - current_ports
+                for port in closed_ports:
+                    await self._stop_proxy(port)
+                    proxy_url = self._port_proxies.pop(port, '')
+                    if proxy_url:
+                        self.log(
+                            'info', f'Closing proxy for port {port} (was {proxy_url})'
+                        )
+
+                previous_ports = current_ports - {
+                    p for p in new_ports if p not in self._port_proxies
+                }  # Remove ports that weren't successfully proxied
+                await asyncio.sleep(2)  # Sleep for 2 seconds before checking again
+
+            except Exception as e:
+                self.log('error', f'Error monitoring ports: {str(e)}')
+                await asyncio.sleep(5)
+
+    @property
+    def web_hosts(self) -> dict[str, int]:
+        """Return a dictionary of active web hosts and their ports."""
+        return {url: port for port, url in self._port_proxies.items()}
+
     async def connect(self):
         self.send_status_message('STATUS$STARTING_RUNTIME')
 
         if self.attach_to_existing:
-            self.workspace: Optional[Workspace] = self._get_workspace()
+            self.workspace = self._get_workspace()
 
         if self.workspace is None:
             self.send_status_message('STATUS$PREPARING_CONTAINER')
-            self.workspace: Workspace = self._create_workspace()
+            self.workspace = self._create_workspace()
             self.log('info', f'Created new workspace with id: {self.workspace_id}')
 
         if self._get_workspace_status() == 'stopped':
@@ -183,6 +363,18 @@ class DaytonaRuntime(ActionExecutionClient):
                 'info',
                 f'Container started. Action execution server url: {self.api_url}',
             )
+            # Install netstat in the workspace
+            exec_session_id = 'port-poller-session'
+            self.workspace.process.create_session(exec_session_id)
+            output = self.workspace.process.execute_session_command(
+                exec_session_id,
+                SessionExecuteRequest(
+                    command='sudo apt update && sudo apt install net-tools -y',
+                    var_async=False,
+                ),
+            )
+
+            self.log('info', f'Netstat installation output: {output.output}')
 
         self.log('info', 'Waiting for client to become ready...')
         self.send_status_message('STATUS$WAITING_FOR_CLIENT')
@@ -196,11 +388,28 @@ class DaytonaRuntime(ActionExecutionClient):
             f'Container initialized with plugins: {[plugin.name for plugin in self.plugins]}',
         )
 
+        # Start port monitoring after workspace is ready
+        asyncio.create_task(self._monitor_ports())
+
         if not self.attach_to_existing:
             self.send_status_message(' ')
         self._runtime_initialized = True
 
-    def close(self):
+    async def close(self):
+        """Override close to cleanup proxy servers."""
+        self._closed = True
+
+        # Stop all proxy servers and wait for them to complete
+        stop_tasks = [
+            self._stop_proxy(port) for port in list(self._proxy_servers.keys())
+        ]
+        if stop_tasks:
+            await asyncio.gather(*stop_tasks)
+
+        # Clear all proxy records
+        self._proxy_servers.clear()
+        self._port_proxies.clear()
+
         super().close()
 
         if self.attach_to_existing:
